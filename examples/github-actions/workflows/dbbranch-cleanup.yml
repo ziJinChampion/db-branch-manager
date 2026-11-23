@@ -1,0 +1,73 @@
+name: Closed PR cleanup and recovery
+on:
+  pull_request_target:
+    types: [closed]
+    branches: [main]
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  closed:
+    if: github.event_name == 'pull_request_target'
+    concurrency:
+      group: dbbranch-preview-${{ github.event.number }}
+      queue: max
+    uses: ./.github/workflows/dbbranch-reconcile-one.yml
+    with:
+      pr: ${{ github.event.number }}
+      closed_only: true
+    secrets: inherit
+
+  inventory:
+    if: github.event_name != 'pull_request_target'
+    runs-on: ubuntu-24.04
+    environment: dbbranch-preview
+    outputs:
+      prs: ${{ steps.inventory.outputs.prs }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ vars.DBBRANCH_REPOSITORY }}
+          ref: ${{ vars.DBBRANCH_REF }}
+          path: manager
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: manager/go.mod
+          cache-dependency-path: manager/go.sum
+      - name: Collect abandoned generations and list remaining PRs
+        id: inventory
+        working-directory: manager
+        env:
+          DBBRANCH_ADMIN_URL: ${{ secrets.DBBRANCH_ADMIN_URL }}
+          REPO_ID: ${{ github.repository_id }}
+        run: |
+          go build -o "$RUNNER_TEMP/dbbranch" ./cmd/dbbranch
+          "$RUNNER_TEMP/dbbranch" gc --repo-id "$REPO_ID" --env preview --older-than 24h
+          prs=$("$RUNNER_TEMP/dbbranch" status --repo-id "$REPO_ID" --env preview --json | jq -c 'map(.pr) | unique')
+          echo "prs=$prs" >> "$GITHUB_OUTPUT"
+
+  recover:
+    needs: inventory
+    if: needs.inventory.outputs.prs != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        pr: ${{ fromJSON(needs.inventory.outputs.prs) }}
+    concurrency:
+      group: dbbranch-preview-${{ matrix.pr }}
+      queue: max
+    uses: ./.github/workflows/dbbranch-reconcile-one.yml
+    with:
+      pr: ${{ matrix.pr }}
+      closed_only: false
+    secrets: inherit

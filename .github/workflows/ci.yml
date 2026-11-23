@@ -1,0 +1,43 @@
+name: CI
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: test-postgres-password
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Prepare disposable PostgreSQL
+        env:
+          PGPORT: ${{ job.services.postgres.ports['5432'] }}
+          PGPASSWORD: test-postgres-password
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y postgresql-client-16
+          psql -X -h 127.0.0.1 -U postgres -v ON_ERROR_STOP=1 -f scripts/test-postgres.sql
+      - name: Test and build
+        env:
+          DBBRANCH_TEST_ADMIN_URL: postgres://dbbranch_manager:test-manager-password@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/dbbranch_admin?sslmode=disable
+        run: |
+          go test -race -count=1 ./...
+          go vet ./...
+          go build ./cmd/dbbranch

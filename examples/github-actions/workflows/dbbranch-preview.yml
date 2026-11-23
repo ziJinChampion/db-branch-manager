@@ -1,0 +1,102 @@
+name: PR preview
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches: [main]
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+
+concurrency:
+  group: dbbranch-preview-${{ github.event.number }}
+  queue: max
+
+jobs:
+  preview:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    environment: dbbranch-preview
+    env:
+      PR: ${{ github.event.number }}
+      REPO_ID: ${{ github.repository_id }}
+      REVISION: ${{ github.sha }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ vars.DBBRANCH_REPOSITORY }}
+          ref: ${{ vars.DBBRANCH_REF }}
+          path: manager
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: manager/go.mod
+          cache-dependency-path: manager/go.sum
+      - name: Build manager and install restore client
+        working-directory: manager
+        run: |
+          go build -o "$RUNNER_TEMP/dbbranch" ./cmd/dbbranch
+          sudo apt-get update -qq
+          sudo apt-get install -y postgresql-client-16
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          path: candidate
+          persist-credentials: false
+      - name: Download baseline for the actual merge parent
+        id: baseline
+        run: |
+          base_sha=$(git -C candidate rev-parse "$REVISION^1")
+          for i in {1..12}; do
+            run_id=$(gh run list -R "$GITHUB_REPOSITORY" --workflow dbbranch-baseline.yml \
+              --commit "$base_sha" --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+            [[ -z "$run_id" && "$i" -lt 12 ]] || break
+            sleep 10
+          done
+          test -n "$run_id" || { echo "No baseline for $base_sha. Publish it, then rerun this workflow." >&2; exit 1; }
+          gh run download "$run_id" -R "$GITHUB_REPOSITORY" --name "dbbranch-$base_sha" --dir "$RUNNER_TEMP/baseline"
+          echo "sha=$base_sha" >> "$GITHUB_OUTPUT"
+      - name: Provision and issue preview credentials
+        id: prepare
+        env:
+          DBBRANCH_ADMIN_URL: ${{ secrets.DBBRANCH_ADMIN_URL }}
+          BASE_SHA: ${{ steps.baseline.outputs.sha }}
+        run: |
+          scope=(--repo-id "$REPO_ID" --env preview --pr "$PR")
+          "$RUNNER_TEMP/dbbranch" create "${scope[@]}" --revision "$REVISION" \
+            --baseline "$BASE_SHA" --attempt "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --archive "$RUNNER_TEMP/baseline/baseline.dump" --json > "$RUNNER_TEMP/generation.json"
+          id=$(jq -er '.id' "$RUNNER_TEMP/generation.json")
+          "$RUNNER_TEMP/dbbranch" connection "${scope[@]}" --id "$id" --file "$RUNNER_TEMP/preview-db-url"
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+      - name: Migrate and deploy
+        env:
+          GENERATION_ID: ${{ steps.prepare.outputs.id }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_BASE: ${{ steps.baseline.outputs.sha }}
+        working-directory: candidate
+        run: |
+          trap 'rm -f "$RUNNER_TEMP/preview-db-url"' EXIT
+          export DATABASE_URL="$(cat "$RUNNER_TEMP/preview-db-url")"
+          echo "::add-mask::$DATABASE_URL"
+          ./ci/migrate-preview.sh
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" | jq -e \
+            --arg head "$EXPECTED_HEAD" --arg base "$EXPECTED_BASE" --arg revision "$REVISION" \
+            '.state == "open" and .head.sha == $head and .base.sha == $base and .merge_commit_sha == $revision' > /dev/null
+          ./ci/deploy-preview.sh "$PR" "$REVISION" "$GENERATION_ID"
+
+  prune:
+    needs: preview
+    if: always() && github.event.pull_request.head.repo.full_name == github.repository
+    uses: ./.github/workflows/dbbranch-reconcile-one.yml
+    with:
+      pr: ${{ github.event.number }}
+      closed_only: false
+    secrets: inherit

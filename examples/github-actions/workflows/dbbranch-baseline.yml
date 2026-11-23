@@ -1,0 +1,27 @@
+name: Publish preview baseline
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Build a trusted test-data snapshot
+        run: ./ci/build-preview-baseline.sh "$RUNNER_TEMP/baseline.dump"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dbbranch-${{ github.sha }}
+          path: ${{ runner.temp }}/baseline.dump
+          if-no-files-found: error
